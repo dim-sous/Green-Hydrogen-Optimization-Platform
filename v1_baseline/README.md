@@ -1,208 +1,255 @@
-# v1_baseline — PI Baseline with Full First-Principles AEL Plant Model
+# v1_baseline — Single-Cell AEL with NMPC + EKF
 
-Establishes the **complete alkaline electrolyzer plant model** (electrochemical + thermal + gas separator) in both NumPy (ground truth) and CasADi (symbolic, for future NMPC). A PI controller provides the baseline: feedforward current proportional to available wind power, feedback cooling on temperature error. All sub-models are validated independently and cross-checked between NumPy and CasADi implementations.
+Single-cell alkaline electrolyzer baseline with **multiple-shooting NMPC** (CasADi/IPOPT), **1D Extended Kalman Filter**, and a PI comparison baseline. The system is formulated as a **semi-explicit index-1 DAE**: temperature is the differential state, current is an algebraic variable determined by the power equality constraint.
 
-## Plant Model
+---
 
-The plant represents a 60-cell alkaline electrolyzer stack operating at 10 bar with active liquid cooling.
+## 1. Model
 
-```
-State:       x = [T, x_HTO]           (temperature, HTO mole fraction)
-Input:       u = [I, Q_cool]           (stack current, cooling power)
-Output:      y = [T, x_HTO, V_stack, ṅ_H₂, SEC]
-Disturbance: d = [P_avail, T_amb]      (available wind power, ambient temperature)
-```
-
-## Electrochemical Sub-Model (Ulleberg 2003)
-
-Cell voltage is the sum of reversible, ohmic, and activation components:
+### DAE System (Semi-Explicit Index-1)
 
 ```
-V_cell = V_rev(T) + V_ohm(T, I) + V_act(T, I)
+Differential state:  x = [T]                                        (1 state)
+Algebraic variable:  z = [I]                                        (1 algebraic)
+Control input:       u = [Q_cool]                                   (1 control)
+Disturbances:        p = [P_avail, T_amb]                           (2 parameters)
+```
+
+### Differential equation (energy balance)
+
+```
+dT/dt = (P_el - n_dot_H2 * DH_rxn - UA * (T - T_amb) - Q_cool) / C_th   [K/s]
 
 where:
-  V_rev(T) = 1.229 - 8.5e-4 * (T - 298.15)                          [V]
-  V_ohm(T, I) = (r1 + r2 * T) / A * I                                [V]
-  V_act(T, I) = s * log10((t1 + t2/T + t3/T²) * j + 1)               [V]
-  j = I / A                                                           [A/m²]
-
-Stack voltage: V_stack = N_cells * V_cell
-Electrical power: P_el = V_stack * I
+  P_el      = V_cell(T, I) * I                                      [W]
+  n_dot_H2  = eta_F(I) * N_cells * I / (2 * F)                      [mol/s]
+  DH_rxn    = 285,800                                                [J/mol]
+  UA        = 0.208                                                  [W/K]
+  C_th      = 10,417                                                 [J/K]
 ```
+
+### Algebraic constraint (power equality)
+
+```
+0 = V_cell(T, I) * I - P_avail                                      [W]
+```
+
+Current I is not a free variable — it is determined by available power and temperature at every instant.
+
+### Electrochemistry (Ulleberg model)
+
+```
+V_cell(T, I) = V_rev(T) + V_ohm(T, I) + V_act(T, I)               [V]
+
+V_rev(T) = 1.229 - 8.5e-4 * (T - 298.15)                           [V]
+
+V_ohm(T, I) = (r1 + r2 * T) / A * I                                [V]
+
+where:
+  r1  = 4.457e-5                                                     [ohm m2]
+  r2  = 6.889e-9                                                     [ohm m2/K]
+  A   = 0.25                                                         [m2]
+
+V_act(T, I) = s * log10[(t1 + t2/T + t3/T^2) * j + 1]              [V]
+
+where:
+  j = I / A                                                          [A/m2]
+  s = 0.185                                                          [V]
+  t1 = 1.002, t2 = 8.424 [K], t3 = 247.3 [K2]
+```
+
+### Faradaic efficiency
+
+```
+eta_F(I) = j^2 / (f1 + j^2) * f2                                    [-]
+
+where:
+  f1 = 250.0                                                         [(A/m2)^2]
+  f2 = 0.98                                                          [-]
+```
+
+### Parameter tables
+
+#### Electrolyzer
 
 | Parameter | Value | Unit | Description |
 |-----------|-------|------|-------------|
-| `N_cells` | 60 | — | Cells in series |
-| `A` | 0.25 | m² | Cell active area |
-| `r1` | 4.457e-5 | Ω·m² | Ohmic resistance coefficient |
-| `r2` | 6.889e-9 | Ω·m²/K | Ohmic temperature coefficient |
-| `s` | 0.185 | V | Activation coefficient |
-| `t1, t2, t3` | 1.002, 8.424, 247.3 | — | Activation overvoltage parameters |
-| `I_min, I_max` | 50, 500 | A | Current operating range |
+| `N_cells` | 1 | - | Cells in series |
+| `A_m2` | 0.25 | m2 | Cell active area |
+| `r1_ohm_m2` | 4.457e-5 | ohm m2 | Ohmic resistance base |
+| `r2_ohm_m2_k` | 6.889e-9 | ohm m2/K | Ohmic resistance temperature coefficient |
+| `s_v` | 0.185 | V | Activation coefficient |
+| `I_min_a` | 50 | A | Minimum current |
+| `I_max_a` | 500 | A | Maximum current |
+| `F_const` | 96,485 | C/mol | Faraday constant |
 
-## Faradaic Efficiency and H₂ Production
+#### Thermal
+
+| Parameter | Value | Unit | Description |
+|-----------|-------|------|-------------|
+| `C_th_jk` | 10,417 | J/K | Thermal capacitance |
+| `UA_loss_wk` | 0.208 | W/K | Heat loss coefficient |
+| `T_amb_k` | 293.15 | K | Ambient temperature (20 C) |
+| `Q_cool_max_w` | 200 | W | Maximum cooling power |
+| `T_min_k` | 323.15 | K | Minimum safe temperature (50 C) |
+| `T_max_k` | 373.15 | K | Maximum safe temperature (100 C) |
+| `DH_rxn_jmol` | 285,800 | J/mol | Reaction enthalpy |
+
+---
+
+## 2. Solver
+
+### Plant simulation
+
+| Component | Method | Library |
+|-----------|--------|---------|
+| Temperature ODE | Forward Euler | NumPy |
+| Power equality (I from P_avail) | Brent's method root-finding | SciPy |
+
+### NMPC prediction model
+
+| Component | Method | Library |
+|-----------|--------|---------|
+| Temperature ODE | Explicit RK4 | CasADi (symbolic) |
+| Power equality | Explicit NLP constraint | CasADi / IPOPT |
+| NLP solver | Interior-point, warm-started | IPOPT |
+
+### EKF prediction model
+
+| Component | Method | Library |
+|-----------|--------|---------|
+| State propagation | DAE collocation integrator | CasADi |
+| Jacobian A = dF/dT | Automatic differentiation | CasADi |
+
+### CasADi DAE integrator (validation + EKF)
+
+```python
+dae = {'x': T, 'z': I, 'p': vertcat(Q_cool, P_avail, T_amb),
+       'ode': dTdt, 'alg': V_cell(T,I)*I - P_avail}
+```
+
+Validation: CasADi DAE integrator matches NumPy plant to < 0.01% relative error over 1-hour trajectories.
+
+---
+
+## 3. Controller
+
+### NMPC (TrackingNMPC)
+
+**Objective**: maximize hydrogen production with soft thermal safety constraints. There is no temperature setpoint — temperature is free within bounds. Soft penalties (Christensen et al. formulation) penalize bound violations quadratically.
 
 ```
-η_F(I) = j² / (f1 + j²) * f2                                        [—]
-ṅ_H₂ = η_F * N_cells * I / (2 * F)                                   [mol/s]
-SEC = P_el / ṅ_H₂                                                    [W·s/mol]
+max   Sum_{k=0}^{N-1}  w_H2 * n_dot_H2(T_k, I_k)
+    - Sum_{k=0}^{N-1}  R_dQ * (Q_cool_k - Q_cool_{k-1})^2
+    - Sum_{k=0}^{N}    w_T_soft * max(0, T_k - T_max)^2
+    - Sum_{k=0}^{N}    w_T_soft * max(0, T_min - T_k)^2
+
+subject to:
+  T_{k+1} = F_rk4(T_k, I_k, Q_cool_k, T_amb)      RK4 integration
+  V_cell(T_k, I_k) * I_k = P_avail_k                power equality
+  T_min <= T_k <= T_max                               thermal bounds
+  I_min <= I_k <= I_max                                current limits
+  0 <= Q_cool_k <= Q_cool_max                         actuator limits
+  T_0 = T_hat                                         from EKF
 ```
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `f1` | 250.0 | Faradaic saturation parameter [A²/m⁴] |
-| `f2` | 0.98 | Faradaic maximum efficiency [—] |
-| `F` | 96485 | Faraday constant [C/mol] |
+| `N` | 48 | Prediction horizon steps |
+| `dt` | 300 s | Prediction step size (5 min) |
+| Horizon | 4 h | Total lookahead (matches Christensen et al.) |
+| `w_H2` | 1e5 | H2 production weight |
+| `R_dQ` | 1e-2 | Cooling rate-of-change penalty |
+| `w_T_soft` | 1e6 | Soft thermal bound penalty |
+| Solver | IPOPT | Interior-point, warm-started |
 
-At rated current (500 A, 353 K): η_F ≈ 0.97, ṅ_H₂ ≈ 0.144 mol/s.
+**Key behavior**: The NMPC pushes temperature toward T_max (where efficiency is highest) and uses the P_avail forecast to anticipate power changes. The 4-hour horizon allows the controller to see upcoming step changes and pre-cool or reduce cooling accordingly.
 
-## Thermal Sub-Model
+### EKF (ExtendedKalmanFilter)
 
-Lumped energy balance with RK45 integration:
-
-```
-dT/dt = (P_el - ṅ_H₂ * ΔH_rxn - UA_loss * (T - T_amb) - Q_cool) / C_th    [K/s]
-```
-
-| Parameter | Value | Unit | Description |
-|-----------|-------|------|-------------|
-| `C_th` | 625,000 | J/K | Thermal capacitance |
-| `UA_loss` | 12.5 | W/K | Heat loss coefficient |
-| `ΔH_rxn` | 285,800 | J/mol | Enthalpy of water splitting |
-| `T_amb` | 293.15 | K | Ambient temperature (20°C) |
-| `Q_cool_max` | 15,000 | W | Maximum cooling power |
-| `T_ref` | 353.15 | K | Reference operating temperature (80°C) |
-| `T_min, T_max` | 323.15, 373.15 | K | Operating bounds (50–100°C) |
-
-**Thermal time constant**: τ = C_th / UA_loss = 50,000 s ≈ 13.9 h (slow dynamics, appropriate for 30 s timestep).
-
-## Gas Separator / HTO Crossover
-
-Hydrogen-to-oxygen crossover dynamics via membrane permeation:
+1D state filter — trivial in this version, establishes architecture for future unmeasured states.
 
 ```
-dx_HTO/dt = (K_perm * Δp - x_HTO * ṅ_H₂) / n_total                  [1/s]
+State:        x = [T]       (1x1)
+Measurement:  y = [T_meas]  (1x1)
 
-where:
-  Δp = 0.5 * p_op                                                    [Pa]
-  n_total = p_op * V_sep / (R * T_ref)                                [mol]
+Predict:  T_minus = F(T_hat, Q_cool, P_avail, T_amb)     P_minus = A*P*A + Q
+Correct:  K = P_minus / (P_minus + R)                      T_hat = T_minus + K*(T_meas - T_minus)
 ```
 
-| Parameter | Value | Unit | Description |
-|-----------|-------|------|-------------|
-| `K_perm` | 5e-10 | mol/(s·Pa) | Membrane permeation coefficient |
-| `V_sep` | 0.05 | m³ | Separator volume |
-| `p_op` | 10e5 | Pa | Operating pressure (10 bar) |
-| `x_HTO_max` | 0.02 | — | Safety limit (2%) |
-| `n_total` | ~207 | mol | Molar holdup (ideal gas law) |
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `Q_T` | 0.01 K^2 | Process noise — moderate model confidence |
+| `R_T` | 0.25 K^2 | Measurement noise — realistic thermocouple (~0.5 K std) |
+| `P0_T` | 1.0 K^2 | Initial uncertainty |
 
-Integration: forward Euler (sufficient for slow membrane dynamics).
+### PI baseline (PIController)
 
-## PI Controller
+Feedback-only cooling control for comparison. Current is determined by the plant. The PI reacts to temperature error but cannot anticipate power changes.
 
 ```
-Feedforward current:  I = I_nom * (P_avail / P_rated)
-PI cooling:           Q_cool = K_p * (T - T_ref) + K_i * ∫(T - T_ref) dt
+Q_cool = K_p * (T - T_ref) + K_i * integral(T - T_ref) dt
 ```
 
-| Parameter | Value | Unit | Description |
-|-----------|-------|------|-------------|
-| `K_p` | 500 | W/K | Proportional gain |
-| `K_i` | 10 | W/(K·s) | Integral gain |
-| `I_nom` | 300 | A | Nominal current |
-| `P_rated` | 125,000 | W | Rated wind power |
+---
 
-Anti-windup: integral clamped to ±Q_cool_max / K_i.
-
-## CasADi Symbolic Model
-
-The full ODE system is reimplemented in CasADi MX symbolics for future NMPC use:
+## Architecture
 
 ```
-xdot = [dT/dt, dx_HTO/dt]     (same physics as NumPy)
-y     = [T, x_HTO, V_stack, ṅ_H₂, SEC]
+                    P_avail forecast (48 steps, 4 h)
+                           |
+                           v
+  +---------------------------------------------+
+  |              TrackingNMPC                    |
+  |  max Sum n_dot_H2(T_k, I_k)                |
+  |  - w_T_soft * max(0, T - T_max)^2          |
+  |  s.t. V_cell * I = P_avail                  |
+  |  CasADi/IPOPT, RK4, warm-started           |
+  +--------------------+------------------------+
+                       | Q_cool*
+                       v
+  +----------+    +----------------------------+
+  |   EKF    |<---|       AEL Plant            |
+  |  T_hat   |    |  dT/dt = f(T, I, Q_cool)  |
+  |          |    |  V*I = P_avail (brentq)    |
+  +----------+    +----------------------------+
+       |                    |
+       | T_hat              | T_meas
+       +--------------------+
 ```
 
-Two integrator methods available:
+## Test Scenario
 
-| Method | Implementation | Characteristics |
-|--------|---------------|-----------------|
-| Collocation | 1 finite element, cubic interpolation | Implicit, stiff-capable, smooth |
-| RK4 | 4-stage explicit Runge-Kutta | Fast, accurate for non-stiff systems |
-
-**Validation**: both methods match NumPy plant to <0.1% relative error over 1-hour open-loop trajectories.
+| Scenario | Duration | Profile | Purpose |
+|----------|----------|---------|---------|
+| `power_step` | 14 h | 600 -> 900 -> 600 -> 50 -> 600 W | Anticipatory control: pre-cool, pre-heat, no-wind recovery |
 
 ## Module Structure
 
 ```
 v1_baseline/
-├── main.py                     # Entry point: runs scenarios, logs metrics + plots
+├── main.py                        VERSION_TAG = "v1_baseline"
+├── README.md                      This file
 ├── config/
-│   └── parameters.py           # All params as frozen dataclasses
+│   └── parameters.py              Frozen dataclasses with unit suffixes
 ├── models/
-│   ├── electrolyzer.py         # Ulleberg electrochemical model
-│   ├── thermal.py              # Lumped energy balance (RK45)
-│   ├── gas_separator.py        # HTO crossover dynamics (Euler)
-│   ├── ael_plant.py            # Combined NumPy plant (ground truth)
-│   └── casadi_model.py         # CasADi symbolic model + integrators
+│   └── ael_model.py               CasADi DAE + NumPy plant (consolidated)
 ├── mpc/
-│   └── baseline_pi.py          # Feedforward current + PI cooling
+│   ├── baseline_pi.py             PI comparison controller
+│   └── nmpc.py                    TrackingNMPC (multiple shooting)
+├── estimation/
+│   └── ekf.py                     ExtendedKalmanFilter (1D)
 ├── data/
-│   └── power_source.py         # Wind turbine emulator + forecast
+│   └── power_source.py            Wind turbine power model
 ├── simulation/
-│   ├── scenarios.py            # 4 test scenarios (steady, ramp, turbulent, cold_start)
-│   └── simulator.py            # Closed-loop runner with logging
-├── visualization/
-│   └── plot_results.py         # 4-panel diagnostic plots
-└── stress_test.py              # 10 integration tests
+│   ├── simulator.py               Closed-loop runner
+│   └── scenarios.py               Power step scenario
+└── visualization/
+    └── plot_results.py            4-panel diagnostic plots
 ```
 
 ## Running
 
 ```bash
-# From repository root
 uv run python v1_baseline/main.py
-
-# Run stress tests
-uv run python v1_baseline/stress_test.py
-
-# Run unit tests
-uv run pytest tests/ -v
 ```
-
-## Stress Tests
-
-10 tests covering all sub-models and closed-loop (all PASS):
-
-| # | Test | Key Finding |
-|---|------|-------------|
-| 1 | Electrolyzer voltage range | V_cell ∈ [1.2, 3.0] V across full operating envelope |
-| 2 | Faradaic efficiency monotonicity | η_F monotonically increasing with current |
-| 3 | Energy conservation | P_el = V_stack × I (error < 1e-6) |
-| 4 | Thermal heating without cooling | >10 K rise from ambient in 50 min |
-| 5 | Gas separator boundedness | x_HTO ∈ [0, 1] over 1000 steps |
-| 6 | CasADi–NumPy single-point | V_stack, ṅ_H₂ relative error < 0.1% |
-| 7 | CasADi trajectory (collocation) | 1 h open-loop: T error < 0.1%, HTO error < 5% |
-| 8 | CasADi trajectory (RK4) | 1 h open-loop: T error < 0.1%, HTO error < 5% |
-| 9 | PI closed-loop (steady_wind) | T and HTO within bounds for 2 h |
-| 10 | PI closed-loop (ramp_up_down) | T and HTO within bounds for 3 h |
-
-## Results
-
-| Metric | steady_wind | ramp_up_down |
-|--------|-------------|--------------|
-| H₂ yield | 526.4 mol | 590.9 mol |
-| Avg SEC | 350,853 W·s/mol | 342,868 W·s/mol |
-| Avg efficiency | 81.5% | 83.4% |
-| T RMSE | 0.46 K | 0.13 K |
-| T range | 352.2–354.5 K | 352.8–353.3 K |
-| HTO max | 0.48% | 0.95% |
-| HTO violations | 0 | 0 |
-| Power utilization | 25.7% | 25.1% |
-| Mean solve time | 9.2 µs | 8.9 µs |
-
-**Key observations**:
-- No constraint violations (temperature within 323–373 K, HTO well below 2%)
-- Power utilization ~25% — the PI controller operates conservatively; significant headroom for NMPC optimization
-- SEC decreases under ramping (higher currents → better Faradaic efficiency)
-- Solve time negligible relative to 30 s timestep — real-time feasible

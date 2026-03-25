@@ -1,68 +1,54 @@
-# AEL-NMPC: Nonlinear MPC for Alkaline Electrolyzer Operation
+# Alkaline Electrolyzer NMPC Platform
 
-Nonlinear Model Predictive Control for dynamic operation of an alkaline electrolyzer
-under renewable power intermittency. Built with CasADi + IPOPT for nonlinear
-optimization and first-principles electrochemical-thermal-mass transfer modeling.
+**Optimal control and state estimation for alkaline electrolyzers under intermittent renewable power.**
+
+## What It Solves
+
+Given variable wind power, how should cooling be controlled to maximize hydrogen production while keeping temperature within safe operating bounds? How can the controller anticipate power changes before they cause thermal violations?
+
+This platform answers these questions using nonlinear model predictive control (NMPC) with a DAE formulation where current is determined by the power equality constraint V(T,I)*I = P_avail.
+
+## Architecture
+
+```
+ Wind Power ──> AEL Plant  <──  NMPC (5 min steps, 4 h horizon)  <──  EKF
+                1-state DAE      maximize H2, soft thermal bounds       1D filter
+                Euler + brentq   CasADi/IPOPT, warm-started             CasADi AD
+```
+
+## Versioned Upgrades
+
+Each version adds one capability, passes a validation gate, and is frozen before the next begins.
+
+| Version | Focus | Key Addition |
+|---------|-------|-------------|
+| **v1** Baseline | Foundation | Single-cell DAE, NMPC+EKF, PI comparison |
+| **v2** Full Plant | Realism | 7-state DAE, simplified control model, CD-EKF with disturbance augmentation |
+| **v3** Stochastic | Robustness | Scenario-tree NMPC for wind uncertainty |
+| **v4** Estimators | Comparison | EKF vs UKF vs MHE |
+| **v5** Model Enrichment | Physics | 3-stage HTO, lye circulation, radiation |
+| **v6** Multi-Stack | Scale | N-in-1 shared BoP, load allocation |
+| **v7** Solvers | Performance | acados vs IPOPT benchmark |
 
 ## Quick Start
 
 ```bash
 uv sync
-uv run pytest tests/ -v
-python -c "
-from src.plant import AELPlant
-from src.control.baseline_pi import PIController
-from src.simulation.runner import SimulationRunner
-from src.simulation.scenarios import steady_wind
-from src.utils.metrics import compute_metrics
-
-plant = AELPlant()
-ctrl = PIController()
-runner = SimulationRunner(plant, ctrl)
-results = runner.run(steady_wind())
-metrics = compute_metrics(results)
-print(metrics)
-"
+uv run python v1_baseline/main.py
 ```
 
-## Architecture
+Results are saved to `results/`. Each version is independently runnable.
 
-```
-Plant (NumPy) ────── u_opt ─────── NMPC (CasADi/IPOPT)
-     │                                  │
-     │ y_meas                           │ x̂, d̂
-     └──────────── Estimator ───────────┘
-                   (v3: Luenberger)
-                   (v4+: MHE)
-```
+## Technical Stack
 
-## Version History
-
-| Version | Adds | Key Result |
-|---------|------|------------|
-| v1_baseline | Full plant model, CasADi model, PI controller | Baseline metrics established |
-| v2_nmpc | Core NMPC replaces PI | Lower SEC, higher H₂ yield |
-| v3_disturbance | Offset-free NMPC + Luenberger observer | Zero steady-state error |
-| v4_mhe | Moving Horizon Estimation | Better state estimation under noise |
-| v5_stochastic | Multi-scenario NMPC | Robust to forecast uncertainty |
-| v6_multi_stack | Multi-stack coordination | Optimal load allocation |
-
-## Key Results
-
-| Version | Scenario | H₂ Yield (mol) | Avg SEC | T RMSE (K) | HTO Violations |
-|---------|----------|-----------------|---------|------------|----------------|
-| v1_pi | steady_wind | — | — | — | — |
-| v1_pi | ramp_up_down | — | — | — | — |
-
-*(Filled after each version run)*
+Python, CasADi + IPOPT (nonlinear optimization), NumPy (numerics), SciPy (root-finding), Matplotlib (visualization).
 
 ## References
 
-- Ulleberg, Ø. (2003). Modeling of advanced alkaline electrolyzers: a system simulation approach.
-- Pannocchia, G. & Rawlings, J.B. (2003). Disturbance models for offset-free MPC.
-- Zhong, W. et al. (2025). Model predictive control for electrolyzer systems.
-- Biegler, L.T. (2010). Nonlinear Programming: Concepts, Algorithms, and Applications.
+- Ulleberg, O. (2003). Modeling of advanced alkaline electrolyzers.
+- Christensen, A.H.D. et al. Nonlinear model predictive control for dynamic operation of an alkaline electrolyzer. DTU.
+- Qiu, Y. et al. (2025). Dynamic operation and control of a multi-stack AWE system. arXiv:2501.14576.
 
-## License
+---
 
-MIT
+*Each version contains its own `README.md` with full mathematical formulations.*

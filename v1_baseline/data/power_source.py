@@ -1,4 +1,10 @@
-"""Renewable power source model (wind turbine + CSV loading)."""
+"""Renewable power source model (wind turbine + CSV loading).
+
+Placeholder — will be replaced with real data in future versions.
+Generates realistic wind-like power profiles scaled for a single AEL cell.
+"""
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -16,43 +22,78 @@ class PowerSource:
         self._time: np.ndarray | None = None
 
     def _wind_power(self, v: float) -> float:
-        x = np.clip((v - self.p.v_ci) / (self.p.v_r - self.p.v_ci), 0.0, 1.0)
-        return self.p.P_rated * x**3
+        """Convert wind speed to power via cubic power curve [W]."""
+        x = np.clip((v - self.p.v_ci_ms) / (self.p.v_r_ms - self.p.v_ci_ms), 0.0, 1.0)
+        return self.p.P_rated_w * x**3
 
     def generate_wind_profile(
-        self, duration: float, dt: float, mean_v: float = 8.0, sigma_v: float = 1.5,
+        self, duration: float, dt: float, mean_v: float = 8.0, k_shape: float = 2.0,
     ) -> None:
-        """Generate turbulent wind speed profile (Kaimal-like filtered noise)."""
+        """Generate wind speed profile with Weibull marginal distribution.
+
+        Uses the inverse-CDF method on autocorrelated uniform samples to
+        produce temporally correlated wind speeds that follow a Weibull
+        distribution — the standard statistical model for wind speed.
+
+        Args:
+            duration: Simulation duration [s]
+            dt: Time step [s]
+            mean_v: Mean wind speed [m/s]
+            k_shape: Weibull shape parameter [-]
+        """
+        from scipy.special import gamma
+        from scipy.stats import norm
+
         n_steps = int(duration / dt) + 1
         self._time = np.linspace(0, duration, n_steps)
 
-        white = self.rng.normal(0, 1, n_steps)
-        tau = 10.0
-        alpha = 1.0 - dt / (tau * dt + dt)
-        filtered = np.zeros(n_steps)
-        filtered[0] = white[0]
-        for i in range(1, n_steps):
-            filtered[i] = alpha * filtered[i - 1] + (1 - alpha) * white[i]
+        # Weibull scale from desired mean: E[V] = λ · Γ(1 + 1/k)
+        lam = mean_v / gamma(1.0 + 1.0 / k_shape)
 
-        wind_speed = np.maximum(mean_v + sigma_v * filtered, 0.0)
+        # Autocorrelated Gaussian noise (first-order AR filter)
+        tau = 10.0  # autocorrelation time-steps
+        alpha = 1.0 - dt / (tau * dt + dt)
+        white = self.rng.normal(0, 1, n_steps)
+        z = np.zeros(n_steps)
+        z[0] = white[0]
+        for i in range(1, n_steps):
+            z[i] = alpha * z[i - 1] + (1 - alpha) * white[i]
+
+        # Gaussian CDF → uniform → inverse Weibull CDF
+        u = norm.cdf(z)
+        u = np.clip(u, 1e-12, 1.0 - 1e-12)
+        wind_speed = lam * (-np.log(1.0 - u)) ** (1.0 / k_shape)
+
         self._power_profile = np.array([self._wind_power(v) for v in wind_speed])
 
     def load_csv(self, path: str | Path) -> None:
+        """Load power profile from CSV file."""
         df = pd.read_csv(path)
         self._power_profile = df["power_kW"].values * 1000.0
         if "timestamp" in df.columns:
             self._time = np.arange(len(self._power_profile)) * 30.0
 
     def P_avail(self, step_idx: int) -> float:
+        """Return available power at time step [W]."""
         if self._power_profile is None:
-            return self.p.P_rated * 0.8
+            return self.p.P_rated_w * 0.8
         idx = np.clip(step_idx, 0, len(self._power_profile) - 1)
         return float(self._power_profile[idx])
 
     def P_forecast(self, step_idx: int, N: int, sigma_frac: float = 0.05) -> np.ndarray:
+        """Return N-step power forecast with growing uncertainty [W].
+
+        Args:
+            step_idx: current time step index
+            N: forecast horizon length
+            sigma_frac: base noise fraction of true power
+
+        Returns:
+            forecast: array of shape (N,) with predicted P_avail [W]
+        """
         forecast = np.zeros(N)
         for k in range(N):
             true_p = self.P_avail(step_idx + k + 1)
-            sigma = sigma_frac * true_p + 0.02 * self.p.P_rated * ((k + 1) / N)
+            sigma = sigma_frac * true_p + 0.02 * self.p.P_rated_w * ((k + 1) / N)
             forecast[k] = max(0.0, true_p + self.rng.normal(0, sigma))
         return forecast

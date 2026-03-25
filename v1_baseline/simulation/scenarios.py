@@ -1,79 +1,59 @@
-"""Predefined test scenarios for AEL simulation."""
+"""Power scenario for AEL simulation.
+
+Based on Christensen et al. (DTU) and thesis code:
+piecewise-constant power with step up and step down,
+designed to test anticipatory thermal control.
+"""
 
 import numpy as np
-from data.power_source import PowerSource
-from config.parameters import PowerSourceParams, ThermalParams
+from config.parameters import ThermalParams
 
 
-def steady_wind(dt: float = 30.0, seed: int = 42) -> dict:
-    """Constant 80% rated power for 2 hours."""
-    duration = 2 * 3600.0
+def power_step(dt: float = 30.0) -> dict:
+    """14-hour piecewise-constant power profile.
+
+    Structure:
+        0 – 2 h:   600 W   (moderate baseline)
+        2 – 5 h:   900 W   (step UP — thermal stress, pre-cool test)
+        5 – 8 h:   600 W   (return to baseline)
+        8 – 10 h:   50 W   (step DOWN near zero — no wind, pre-heat test)
+       10 – 14 h:  600 W   (step UP back to baseline — recovery)
+
+    Tests:
+    1. Pre-cooling before 600→900 W step (hour 2)
+    2. Reduce cooling before 900→600 W drop (hour 5)
+    3. Pre-heating / stop cooling before 600→50 W drop (hour 8)
+    4. Resume cooling before 50→600 W step up (hour 10)
+    """
+    duration = 14 * 3600.0
     n_steps = int(duration / dt)
-    P_rated = PowerSourceParams().P_rated
-    T_amb = ThermalParams().T_amb
+    T_amb = ThermalParams().T_amb_k
+
+    t = np.arange(n_steps) * dt
+    t_h = t / 3600.0
+
+    power = np.empty(n_steps)
+    for k in range(n_steps):
+        h = t_h[k]
+        if h < 2.0:
+            power[k] = 600.0
+        elif h < 5.0:
+            power[k] = 900.0
+        elif h < 8.0:
+            power[k] = 600.0
+        elif h < 10.0:
+            power[k] = 50.0
+        else:
+            power[k] = 600.0
+
     return {
-        "name": "steady_wind",
-        "duration": duration, "dt": dt, "n_steps": n_steps,
-        "power_profile": np.full(n_steps, 0.8 * P_rated),
-        "T_amb_profile": np.full(n_steps, T_amb),
-    }
-
-
-def ramp_up_down(dt: float = 30.0, seed: int = 42) -> dict:
-    """Linear ramp 20% -> 100% -> 20% over 3 hours."""
-    duration = 3 * 3600.0
-    n_steps = int(duration / dt)
-    P_rated = PowerSourceParams().P_rated
-    T_amb = ThermalParams().T_amb
-    t = np.linspace(0, duration, n_steps)
-    half = duration / 2.0
-    power = np.where(
-        t <= half,
-        P_rated * (0.2 + 0.8 * t / half),
-        P_rated * (1.0 - 0.8 * (t - half) / half),
-    )
-    return {
-        "name": "ramp_up_down",
-        "duration": duration, "dt": dt, "n_steps": n_steps,
-        "power_profile": power,
-        "T_amb_profile": np.full(n_steps, T_amb),
-    }
-
-
-def turbulent_wind(dt: float = 30.0, seed: int = 42) -> dict:
-    """Kaimal-spectrum turbulent wind for 6 hours."""
-    duration = 6 * 3600.0
-    n_steps = int(duration / dt)
-    T_amb = ThermalParams().T_amb
-    ps = PowerSource(seed=seed)
-    ps.generate_wind_profile(duration, dt, mean_v=8.0, sigma_v=2.0)
-    power = np.array([ps.P_avail(k) for k in range(n_steps)])
-    return {
-        "name": "turbulent_wind",
+        "name": "power_step",
         "duration": duration, "dt": dt, "n_steps": n_steps,
         "power_profile": power,
         "T_amb_profile": np.full(n_steps, T_amb),
-    }
-
-
-def cold_start(dt: float = 30.0, seed: int = 42) -> dict:
-    """Plant starts at ambient temperature, 2 h at 80% power."""
-    duration = 2 * 3600.0
-    n_steps = int(duration / dt)
-    P_rated = PowerSourceParams().P_rated
-    T_amb = ThermalParams().T_amb
-    return {
-        "name": "cold_start",
-        "duration": duration, "dt": dt, "n_steps": n_steps,
-        "power_profile": np.full(n_steps, 0.8 * P_rated),
-        "T_amb_profile": np.full(n_steps, T_amb),
-        "T0": T_amb,
     }
 
 
 SCENARIOS = {
-    "steady_wind": steady_wind,
-    "ramp_up_down": ramp_up_down,
-    "turbulent_wind": turbulent_wind,
-    "cold_start": cold_start,
+    "power_step": power_step,
 }

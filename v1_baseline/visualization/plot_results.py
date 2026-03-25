@@ -1,69 +1,171 @@
-"""Plotting utilities for AEL simulation results."""
+"""Four-panel result visualisation for AEL v1 baseline.
+
+Panel layout (2 rows x 2 columns)
+----------------------------------
+  [0,0] Temperature (state) + hard bounds     |  [0,1] Power profile (disturbance + P_el)
+  [1,0] Cooling power (control) + limits      |  [1,1] H₂ production rate + cumulative yield
+
+All constraint limits (hard bounds, actuator limits) are shown on each panel.
+"""
+
+from __future__ import annotations
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator
 from pathlib import Path
 
+from config.parameters import ThermalParams, ElectrolyzerParams
 
-def plot_results(results: dict, metrics: dict | None = None, save_path: str | None = None) -> None:
-    """Plot simulation results in a 4-panel figure."""
-    t = results["t"][:-1] / 3600.0
+
+# ── Global style constants ───────────────────────────────────────────
+_SUPTITLE_SIZE = 17
+_TITLE_SIZE = 15
+_LABEL_SIZE = 12
+_TICK_SIZE = 11
+_LEGEND_SIZE = 9
+_LW_MAIN = 2.2
+_LW_SEC = 1.6
+_LW_REF = 1.0
+
+
+def plot_results(
+    results: dict,
+    metrics: dict | None = None,
+    save_path: str | None = None,
+    controller_label: str = "v1 Baseline",
+) -> None:
+    """Generate the four-panel summary figure.
+
+    Output format y = [T, V_cell, n_dot_H2, SEC, I_actual]
+    """
+    plt.rcParams.update({
+        "font.size": _TICK_SIZE,
+        "axes.titlesize": _TITLE_SIZE,
+        "axes.labelsize": _LABEL_SIZE,
+        "xtick.labelsize": _TICK_SIZE,
+        "ytick.labelsize": _TICK_SIZE,
+        "legend.fontsize": _LEGEND_SIZE,
+    })
+
+    tp = ThermalParams()
+
+    t_h = results["t"][:-1] / 3600.0
     y = results["y"]
     u = results["u"]
     d = results["d"]
+    dt = results["dt"]
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-    fig.suptitle(f"AEL Simulation — {results['scenario']}", fontsize=14)
+    T       = y[:, 0]                    # [K]
+    V_cell  = y[:, 1]                    # [V]
+    n_dot   = y[:, 2] * 1000            # [mol/s] -> [mmol/s]
+    I       = y[:, 4]                    # [A]
+    P_avail = d[:, 0]                    # [W]
+    P_el    = V_cell * I                 # [W]
+    Q_cool  = u[:, 0]                    # [W]
 
-    # Temperature
-    ax = axes[0]
-    ax.plot(t, y[:, 0], "r-", label="T (K)")
-    ax.axhline(353.15, color="k", ls="--", alpha=0.5, label="T_ref")
-    ax.axhline(323.15, color="b", ls=":", alpha=0.5, label="T_min")
-    ax.axhline(373.15, color="b", ls=":", alpha=0.5, label="T_max")
-    ax.set_ylabel("Temperature (K)")
-    ax.legend(loc="upper right", fontsize=8)
+    duration_h = t_h[-1] - t_h[0]
+
+    fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+    fig.suptitle(
+        f"AEL Digital Twin — {controller_label} — {results['scenario']} "
+        f"({duration_h:.0f} h)",
+        fontsize=_SUPTITLE_SIZE, fontweight="bold", y=0.995,
+    )
+
+    # ── [0,0] Temperature (state) ───────────────────────────────────
+    ax = axes[0, 0]
+    ax.axhspan(tp.T_max_k, tp.T_max_k + 20, alpha=0.08, color="red",
+               label="Unsafe")
+    ax.axhspan(tp.T_min_k - 20, tp.T_min_k, alpha=0.08, color="red")
+    ax.axhline(tp.T_max_k, color="tab:red", lw=_LW_REF, ls="--",
+               label=f"T_max = {tp.T_max_k:.0f} K")
+    ax.axhline(tp.T_min_k, color="tab:red", lw=_LW_REF, ls="--",
+               label=f"T_min = {tp.T_min_k:.0f} K")
+    ax.plot(t_h, T, color="0.25", lw=_LW_MAIN, label="T (state)")
+    if metrics:
+        ax.annotate(
+            f"Max = {metrics['T_max_K']:.1f} K\n"
+            f"Min = {metrics['T_min_K']:.1f} K\n"
+            f"Violations = {metrics['T_violations']}",
+            xy=(0.02, 0.95), xycoords="axes fraction",
+            fontsize=_LEGEND_SIZE + 1, fontweight="bold", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="wheat", alpha=0.7),
+        )
+    ax.set_ylabel("Temperature [K]")
+    ax.set_title("Temperature (State, Hard Constraint)")
+    ax.legend(loc="center right", fontsize=_LEGEND_SIZE - 1)
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
     ax.grid(True, alpha=0.3)
 
-    # HTO
-    ax = axes[1]
-    ax.plot(t, y[:, 1] * 100, "g-", label="x_HTO (%)")
-    ax.axhline(2.0, color="r", ls="--", label="Safety limit (2%)")
-    ax.set_ylabel("HTO (vol%)")
-    ax.legend(loc="upper right", fontsize=8)
+    # ── [0,1] Power profile (disturbance + response) ────────────────
+    ax = axes[0, 1]
+    ax.plot(t_h, P_avail, color="tab:orange", lw=_LW_MAIN,
+            label="P_avail (disturbance)")
+    ax.plot(t_h, P_el, color="tab:blue", lw=_LW_SEC, ls="--",
+            alpha=0.8, label="P_el (consumed)")
+    if metrics:
+        ax.annotate(
+            f"Utilisation = {metrics['power_utilization']:.1%}",
+            xy=(0.02, 0.95), xycoords="axes fraction",
+            fontsize=_LEGEND_SIZE + 1, fontweight="bold", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="wheat", alpha=0.7),
+        )
+    ax.set_ylabel("Power [W]")
+    ax.set_title("Power (Disturbance, P_el = P_avail)")
+    ax.legend(loc="upper right")
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
     ax.grid(True, alpha=0.3)
 
-    # Power and H2
-    ax = axes[2]
-    P_el = y[:, 2] * u[:, 0]
-    ax.plot(t, d[:, 0] / 1000, "b--", alpha=0.7, label="P_avail (kW)")
-    ax.plot(t, P_el / 1000, "b-", label="P_el (kW)")
+    # ── [1,0] Cooling power (control input) ──────────────────────────
+    ax = axes[1, 0]
+    ax.plot(t_h, Q_cool, color="0.25", lw=_LW_MAIN, label="Q_cool (control)")
+    ax.axhline(tp.Q_cool_max_w, color="tab:red", lw=_LW_REF, ls="--",
+               alpha=0.7, label=f"Q_cool_max = {tp.Q_cool_max_w:.0f} W")
+    ax.axhline(0.0, color="tab:red", lw=_LW_REF, ls="--",
+               alpha=0.7, label="Q_cool_min = 0 W")
+    if metrics:
+        ax.annotate(
+            f"Avg = {metrics['avg_Q_cool_W']:.0f} W",
+            xy=(0.02, 0.95), xycoords="axes fraction",
+            fontsize=_LEGEND_SIZE + 1, fontweight="bold", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="wheat", alpha=0.7),
+        )
+    ax.set_ylabel("Cooling [W]")
+    ax.set_xlabel("Time [h]")
+    ax.set_title("Cooling Power (Control Input, Actuator Limits)")
+    ax.legend(loc="upper right")
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.grid(True, alpha=0.3)
+
+    # ── [1,1] H₂ production ─────────────────────────────────────────
+    ax = axes[1, 1]
+    ax.plot(t_h, n_dot, color="tab:blue", lw=_LW_MAIN, label="H₂ rate")
+    ax.set_ylabel("H₂ rate [mmol/s]")
+    ax.set_xlabel("Time [h]")
+    ax.set_title("Hydrogen Production (Objective)")
+    ax.legend(loc="upper left")
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.grid(True, alpha=0.3)
+
+    cum_mol = np.cumsum(y[:, 2] * dt)
     ax2 = ax.twinx()
-    ax2.plot(t, y[:, 3] * 1000, "m-", alpha=0.8, label="n_dot_H2 (mmol/s)")
-    ax.set_ylabel("Power (kW)")
-    ax2.set_ylabel("H2 rate (mmol/s)")
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # Control inputs
-    ax = axes[3]
-    ax.plot(t, u[:, 0], "k-", label="I (A)")
-    ax3 = ax.twinx()
-    ax3.plot(t, u[:, 1] / 1000, "c-", label="Q_cool (kW)")
-    ax.set_ylabel("Current (A)")
-    ax3.set_ylabel("Cooling (kW)")
-    ax.set_xlabel("Time (h)")
-    lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax3.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
-    ax.grid(True, alpha=0.3)
+    ax2.plot(t_h, cum_mol, color="tab:green", lw=_LW_SEC, alpha=0.6,
+             ls="--", label="Cumulative yield")
+    ax2.set_ylabel("Cumulative H₂ [mol]", color="tab:green", alpha=0.6)
+    ax2.tick_params(axis="y", colors="tab:green", labelsize=_TICK_SIZE)
+    if metrics:
+        ax.annotate(
+            f"Total = {metrics['H2_yield_mol']:.1f} mol",
+            xy=(0.02, 0.95), xycoords="axes fraction",
+            fontsize=_LEGEND_SIZE + 1, fontweight="bold", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="wheat", alpha=0.7),
+        )
 
     plt.tight_layout()
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=180, bbox_inches="tight")
     plt.close(fig)

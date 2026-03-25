@@ -1,13 +1,12 @@
 ## Current State
-- Completed: v1 (4-stage gate passed: validation, evaluation, comparison, stress testing)
-- Next: v2
-- Frozen (do not modify): v1
-- Gate reports: see BACKLOG.md
+- Active: v1 (baseline — NMPC + EKF + PI comparison, single cell, DAE formulation)
+- Next: v2 (full 7-state plant, simplified control model, CD-EKF with disturbance augmentation)
+- Status: v1 NMPC soft constraint tuning in progress
 
 ## If context is unclear Re-read this file top to bottom. Ask me to confirm the current version.
 
 You are assisting in the development of an industry-grade alkaline electrolyzer digital twin, control, and optimization platform in Python.
-Version 1 (baseline) is already implemented. All further development follows an incremental engineering process toward a robust, production-grade system.
+Version 1 (baseline) is the current working version. All further development follows an incremental engineering process toward a robust, production-grade system.
 ────────────────────────────────────────
 BEHAVIORAL PRINCIPLES
 ────────────────────────────────────────
@@ -30,38 +29,51 @@ Prefer the smallest implementation that meaningfully advances the system. If a p
 6. COMPUTATIONAL AWARENESS
 For each upgrade, note the effect on simulation and solver time. Ensure the system remains tractable. Flag any upgrade that risks making real-time operation infeasible.
 ────────────────────────────────────────
-VERSIONING STRUCTURE
+CODEBASE STRUCTURE — mirrors Energy Storage Optimization Platform
+────────────────────────────────────────
+Each version folder follows this module layout:
+
+vN_<name>/
+├── main.py                    # Entry point with VERSION_TAG
+├── README.md                  # Math-heavy: full equations, parameters, results
+├── stress_test.py             # Validation test suite
+├── config/parameters.py       # Frozen dataclasses, explicit units
+├── models/                    # CasADi symbolic + NumPy plant
+├── mpc/                       # Controller (NMPC, PI)
+├── estimation/                # State estimators (EKF, MHE)
+├── data/                      # Power source / disturbance generators
+├── simulation/                # Closed-loop runner + scenarios
+└── visualization/             # Plotting
+
+Conventions:
+- All parameters as @dataclass(frozen=True) with unit suffix names (e.g. C_th_jk, T_amb_k, P_rated_w)
+- Comment style: # Description [unit]
+- Type hints on all function signatures
+- VERSION_TAG = "vN_<name>" in main.py
+- Equations in code comments match README notation
+- Root README.md: simple (architecture + results)
+- Version README.md: math-heavy (full ODE/DAE system + parameter tables)
+────────────────────────────────────────
+VERSIONING STRUCTURE (draft roadmap)
 ────────────────────────────────────────
 ael_nmpc/
-├── v1_baseline/
-├── v2_nmpc/
-├── v3_disturbance/
-├── v4_mhe/
-├── v5_stochastic/
-├── v6_multi_stack/
+├── v1_baseline/       Single-cell DAE, NMPC+EKF, PI comparison
+├── v2_full_plant/     7-state DAE plant, simplified control model, CD-EKF + disturbance augmentation
+├── v3_stochastic/     Scenario-tree NMPC for wind forecast uncertainty
+├── v4_estimators/     EKF vs UKF vs MHE comparison study
+├── v5_model_enrich/   3-stage HTO model (Qiu), lye circulation, radiation losses
+├── v6_multi_stack/    N-in-1 shared BoP, inter-stack load allocation NMPC
+├── v7_solvers/        acados vs IPOPT vs ESDIRK34 solver comparison
 ├── comparison/
 └── results/version_comparison.csv
 ────────────────────────────────────────
 STANDARD METRICS — compute and store after every version
 ────────────────────────────────────────
-Control: RMSE_temperature_tracking, RMSE_power_tracking
-Production: total_H2_yield, avg_SEC, min_SEC
-Safety: HTO_violations, max_temperature, max_current_density
-Computational: avg_mpc_solve_time, max_mpc_solve_time, estimator_solve_time
-Store in results/version_comparison.csv. Generate comparison plots for: temperature, current density, H₂ production rate, SEC, power, solver time.
-────────────────────────────────────────
-UPGRADE BACKLOG — implement in priority order
-────────────────────────────────────────
-v2 — Core NMPC (Medium difficulty / Extremely High importance)
-Replace PI with CasADi/IPOPT NMPC. Multi-objective: maximize H₂ yield, minimize SEC, respect thermal/HTO constraints. Use existing CasADi model.
-v3 — Offset-Free NMPC + Disturbance Estimation (Medium / Very High)
-Add Luenberger observer for disturbance estimation. Achieve zero steady-state tracking error under model-plant mismatch.
-v4 — Moving Horizon Estimation (Medium-High / Very High)
-Replace Luenberger with MHE for joint state and disturbance estimation. Handle measurement noise and constraints.
-v5 — Stochastic NMPC (High / High)
-Multi-scenario NMPC for robust operation under wind forecast uncertainty.
-v6 — Multi-Stack Coordination (Very High / High)
-Optimal load allocation across multiple electrolyzer stacks.
+Production: total_H2_yield, avg_SEC
+Safety: T_violations, T_max, T_min
+Control: power_utilization, avg_Q_cool
+Computational: avg_mpc_solve_time, max_mpc_solve_time
+Store in results/version_comparison.csv.
 ────────────────────────────────────────
 The goal is a well-tested, physically realistic, and maintainable platform that improves measurably at each step — not one that is maximally complex.
 ────────────────────────────────────────

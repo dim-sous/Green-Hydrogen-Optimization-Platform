@@ -1,17 +1,19 @@
 from config.parameters import (
     ElectrolyzerParams,
     ThermalParams,
-    GasSeparatorParams,
     PowerSourceParams,
     PIControlParams,
+    NMPCParams,
+    EKFParams,
     SimulationParams,
 )
 
 __all__ = [
     "ElectrolyzerParams",
     "ThermalParams",
-    "GasSeparatorParams",
     "PowerSourceParams",
     "PIControlParams",
+    "NMPCParams",
+    "EKFParams",
     "SimulationParams",
 ]

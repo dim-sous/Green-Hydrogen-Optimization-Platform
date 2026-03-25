@@ -1,44 +1,46 @@
-"""PI baseline controller for alkaline electrolyzer."""
+"""PI baseline controller for alkaline electrolyzer.
+
+Feedback-only cooling control. Current is determined by the plant
+(power equality V_cell·I = P_avail), so the PI only controls Q_cool.
+Kept as a comparison baseline for NMPC.
+"""
 
 import numpy as np
-from config.parameters import PIControlParams, ThermalParams, ElectrolyzerParams, PowerSourceParams
+from config.parameters import PIControlParams, ThermalParams
 
 
 class PIController:
-    """PI controller: feedforward current + feedback cooling."""
+    """PI feedback controller: temperature error → Q_cool."""
 
     def __init__(
         self,
         pi: PIControlParams | None = None,
         th: ThermalParams | None = None,
-        ely: ElectrolyzerParams | None = None,
-        ps: PowerSourceParams | None = None,
     ):
         self.pi = pi or PIControlParams()
         th = th or ThermalParams()
-        ely = ely or ElectrolyzerParams()
-        ps = ps or PowerSourceParams()
 
-        self.T_ref = th.T_ref
-        self.I_min = ely.I_min
-        self.I_max = ely.I_max
-        self.P_rated = ps.P_rated
-        self.Q_cool_max = th.Q_cool_max
+        self.T_ref = th.T_ref_k
+        self.Q_cool_max = th.Q_cool_max_w
         self._integral_error = 0.0
 
     def reset(self) -> None:
         self._integral_error = 0.0
 
     def step(self, x: np.ndarray, d: np.ndarray, dt: float) -> np.ndarray:
-        """Compute control action u = [I, Q_cool] from state x and disturbance d."""
+        """Compute control action u = [Q_cool] from state x and disturbance d.
+
+        Args:
+            x: [T]               state [K]
+            d: [P_avail, T_amb]  disturbances [W, K]
+            dt: time step [s]
+
+        Returns:
+            u: [Q_cool]  control [W]
+        """
         T = x[0]
-        P_avail = d[0]
 
-        # Feedforward current
-        I = self.pi.I_nom * (P_avail / self.P_rated)
-        I = np.clip(I, self.I_min, self.I_max)
-
-        # PI temperature control
+        # PI temperature control with anti-windup
         error = T - self.T_ref
         self._integral_error += error * dt
         self._integral_error = np.clip(
@@ -50,4 +52,4 @@ class PIController:
         Q_cool = self.pi.K_p_T * error + self.pi.K_i_T * self._integral_error
         Q_cool = np.clip(Q_cool, 0.0, self.Q_cool_max)
 
-        return np.array([I, Q_cool])
+        return np.array([Q_cool])
