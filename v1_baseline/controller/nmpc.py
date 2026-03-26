@@ -146,11 +146,14 @@ class TrackingNMPC:
             T_next = self._F_rk4(T_prev, Ik, Qk, T_amb)
 
             # Decision: T_{k+1} (state at next node)
+            # 2K safety margin: NMPC plans at 300s but plant runs at 30s,
+            # so inter-node temperature can overshoot the shooting nodes.
+            T_margin_k = 2.0
             Tk = ca.MX.sym(f"T_{k+1}")
             w.append(Tk)
             w0.append(float(tp.T_ref_k))
-            lbw.append(float(tp.T_min_k))
-            ubw.append(float(tp.T_max_k))
+            lbw.append(float(tp.T_min_k + T_margin_k))
+            ubw.append(float(tp.T_max_k - T_margin_k))
 
             # Soft thermal bound penalties (Christensen eq. 40):
             #   w_soft * max(0, T - T_max)^2  +  w_soft * max(0, T_min - T)^2

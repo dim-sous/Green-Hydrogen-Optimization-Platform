@@ -2,8 +2,7 @@ from config.parameters import (
     ElectrolyzerParams,
     ThermalParams,
     PowerSourceParams,
-    NMPCParams,
-    EKFParams,
+    PIDControlParams,
     SimulationParams,
 )
 
@@ -11,7 +10,6 @@ __all__ = [
     "ElectrolyzerParams",
     "ThermalParams",
     "PowerSourceParams",
-    "NMPCParams",
-    "EKFParams",
+    "PIDControlParams",
     "SimulationParams",
 ]

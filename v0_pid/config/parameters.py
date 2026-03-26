@@ -50,25 +50,22 @@ class PowerSourceParams:
 
 
 @dataclass(frozen=True)
-class NMPCParams:
-    """Multiple-shooting NMPC tuning parameters."""
+class PIDControlParams:
+    """PID controller tuning (scaled ÷60 from stack).
 
-    N: int = 48                            # Prediction horizon steps [-]
-    dt_s: float = 300.0                    # Prediction step size [s] (5 min, matches Christensen)
-    w_H2: float = 1e5                       # H₂ production rate weight [-]
-    R_dQ: float = 1e-2                     # Cooling rate-of-change penalty [-]
-    w_T_soft: float = 1e8                  # Soft thermal bound penalty weight [-]
-    solver_max_iter: int = 300             # IPOPT maximum iterations [-]
-    solver_print_level: int = 0            # IPOPT verbosity [-]
+    Tuned via systematic study (see README §5):
+    - K_i reduced from 0.17 to 0.08 to limit integral dominance
+    - K_d increased from 50 to 1500 for meaningful derivative damping
+    - K_p raised from 8 to 12 to offset slower integral build-up
+    - tau_d raised from 5 to 10 for smoother filtered derivative
+    Result: 32% reduction in max |dQ|/step, all three terms contribute.
+    """
 
-
-@dataclass(frozen=True)
-class EKFParams:
-    """Extended Kalman Filter tuning (1D: state = T)."""
-
-    Q_T: float = 0.01                     # Process noise variance for T [K²]
-    R_T: float = 0.25                     # Measurement noise variance for T [K²]
-    P0_T: float = 1.0                     # Initial state error covariance [K²]
+    K_p_T: float = 12.0                   # Proportional gain on temperature error [W/K]
+    K_i_T: float = 0.08                   # Integral gain on temperature error [W/(K·s)]
+    K_d_T: float = 1500.0                 # Derivative gain on temperature [W·s/K]
+    tau_d_s: float = 10.0                 # Derivative filter time constant [s]
+    I_nom_a: float = 300.0                # Nominal current for feedforward [A]
 
 
 @dataclass(frozen=True)

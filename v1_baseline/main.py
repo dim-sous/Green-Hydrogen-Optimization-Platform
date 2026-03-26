@@ -1,4 +1,4 @@
-"""v1_baseline — Single-cell AEL with NMPC + EKF and PI comparison.
+"""v1_baseline — Single-cell AEL with NMPC + EKF.
 
 Entry point for running simulations, validation, and saving results.
 """
@@ -26,8 +26,7 @@ from config.parameters import (
     SimulationParams,
 )
 from models.ael_model import AELPlant, build_casadi_dynamics, build_casadi_integrator
-from mpc.baseline_pi import PIController
-from mpc.nmpc import TrackingNMPC
+from controller.nmpc import TrackingNMPC
 from estimation.ekf import ExtendedKalmanFilter
 from simulation.simulator import SimulationRunner
 from simulation.scenarios import SCENARIOS
@@ -55,11 +54,13 @@ class NMPCWithEKF:
         nmpc: TrackingNMPC,
         ekf: ExtendedKalmanFilter,
         power_forecast_func=None,
+        solve_stride: int = 10,
     ):
         self.nmpc = nmpc
         self.ekf = ekf
         self._power_forecast_func = power_forecast_func
-        self._u_prev = np.array([0.0])  # start with no cooling
+        self._solve_stride = solve_stride  # solve NMPC every N sim steps
+        self._u_prev = np.array([0.0])
         self._step_idx = 0
 
     def reset(self) -> None:
@@ -71,6 +72,10 @@ class NMPCWithEKF:
     def step(self, x: np.ndarray, d: np.ndarray, dt: float) -> np.ndarray:
         """Compute NMPC control from EKF-filtered state.
 
+        The NMPC NLP is only solved every solve_stride simulation steps
+        (matching the NMPC dt). Between solves, the last control is held.
+        The EKF runs every step.
+
         Args:
             x: plant state [T] — used as measurement (1,)
             d: [P_avail, T_amb] disturbances (2,)
@@ -81,23 +86,21 @@ class NMPCWithEKF:
         """
         T_meas = x[0]
 
-        # EKF: predict + correct
+        # EKF: predict + correct every step
         x_hat = self.ekf.step(self._u_prev, d, T_meas)
 
-        # Build P_avail forecast over horizon
-        N = self.nmpc._N
-        if self._power_forecast_func is not None:
-            d_forecast = self._power_forecast_func(self._step_idx, N)
-        else:
-            # Constant forecast (current P_avail held over horizon)
-            d_forecast = np.full(N, d[0])
+        # NMPC: solve only every solve_stride steps
+        if self._step_idx % self._solve_stride == 0:
+            N = self.nmpc._N
+            if self._power_forecast_func is not None:
+                d_forecast = self._power_forecast_func(self._step_idx, N)
+            else:
+                d_forecast = np.full(N, d[0])
+            u = self.nmpc.step(x_hat, d_forecast, dt)
+            self._u_prev = u
 
-        # NMPC solve
-        u = self.nmpc.step(x_hat, d_forecast, dt)
-
-        self._u_prev = u
         self._step_idx += 1
-        return u
+        return self._u_prev
 
 
 # ---------------------------------------------------------------------------
@@ -127,12 +130,13 @@ def compute_metrics(results: dict) -> dict:
     H2_yield = float(np.sum(n_dot) * dt)
     producing = n_dot > 1e-10
     avg_SEC = float(np.mean(SEC[producing])) if np.any(producing) else 0.0
-    avg_SEC_Wh = avg_SEC / 3600.0  # J/mol → Wh/mol
+    avg_SEC_Wh = avg_SEC / 3600.0  # J/mol -> Wh/mol
 
     T_violations = int(np.sum((T > tp.T_max_k) | (T < tp.T_min_k)))
 
+    safe_P = np.where(P_avail > 1e-6, P_avail, 1.0)
     power_util = float(np.mean(
-        np.where(P_avail > 1e-6, P_el / P_avail, 0.0)
+        np.where(P_avail > 1e-6, P_el / safe_P, 0.0)
     ))
 
     mean_solve = float(np.mean(results["solve_times"]))
@@ -198,30 +202,8 @@ def validate_casadi_dae() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scenario runners
+# Scenario runner
 # ---------------------------------------------------------------------------
-
-def run_pi_scenario(name: str) -> dict:
-    """Run a scenario with PI controller."""
-    plant = AELPlant()
-    ctrl = PIController()
-    runner = SimulationRunner(plant, ctrl)
-
-    scenario = SCENARIOS[name]()
-    results = runner.run(scenario)
-    metrics = compute_metrics(results)
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    plot_results(results, metrics,
-                 save_path=str(RESULTS_DIR / f"pi_{name}.png"),
-                 controller_label="PI Controller")
-
-    with open(RESULTS_DIR / f"pi_{name}.json", "w") as f:
-        json.dump({"version": VERSION_TAG, "controller": "PI",
-                    "scenario": name, **metrics}, f, indent=2)
-
-    return metrics
-
 
 def run_nmpc_scenario(name: str) -> dict:
     """Run a scenario with NMPC + EKF controller."""
@@ -279,16 +261,10 @@ def main() -> None:
     validate_casadi_dae()
     log.info("")
 
-    # 2. Run scenarios with both controllers
+    # 2. Run scenarios with NMPC + EKF
     for scenario_name in ["power_step"]:
         log.info(f"--- Scenario: {scenario_name} ---")
 
-        log.info("  [PI Controller]")
-        pi_metrics = run_pi_scenario(scenario_name)
-        for k, v in pi_metrics.items():
-            log.info(f"    {k:25s}: {v:.4f}" if isinstance(v, float) else f"    {k:25s}: {v}")
-
-        log.info("")
         log.info("  [NMPC + EKF]")
         nmpc_metrics = run_nmpc_scenario(scenario_name)
         for k, v in nmpc_metrics.items():

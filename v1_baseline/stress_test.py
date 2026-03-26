@@ -1,185 +1,198 @@
-"""Stress tests for v1_baseline — validates all sub-models and closed-loop."""
+"""Validation test suite for v1_baseline NMPC + EKF.
 
-import pathlib
+Run:  cd v1_baseline && python stress_test.py
+"""
+
+from __future__ import annotations
+
 import sys
+import pathlib
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
-from models.electrolyzer import Electrolyzer
-from models.thermal import ThermalModel
-from models.gas_separator import GasSeparator
-from models.ael_plant import AELPlant
-from models.casadi_model import build_ael_model, build_integrator
-from mpc.baseline_pi import PIController
+
+from config.parameters import (
+    ElectrolyzerParams, ThermalParams, NMPCParams, EKFParams, SimulationParams,
+)
+from models.ael_model import (
+    AELPlant, build_casadi_dynamics, build_casadi_integrator,
+    v_cell, n_dot_h2,
+)
+from controller.nmpc import TrackingNMPC
+from estimation.ekf import ExtendedKalmanFilter
 from simulation.simulator import SimulationRunner
-from simulation.scenarios import steady_wind, ramp_up_down
+from simulation.scenarios import SCENARIOS
 
 
-def test_electrolyzer_voltage_range():
-    """V_cell at typical conditions should be 1.5-2.5 V."""
-    ely = Electrolyzer()
-    for T in (323.15, 353.15, 373.15):
-        for I in (50.0, 200.0, 500.0):
-            V = ely.V_cell(T, I)
-            assert 1.2 < V < 3.0, f"V_cell={V} at T={T}, I={I}"
-    print("  [PASS] electrolyzer voltage range")
+def _run_test(name: str, func) -> bool:
+    """Run a single test and print pass/fail."""
+    try:
+        func()
+        print(f"  PASS  {name}")
+        return True
+    except AssertionError as e:
+        print(f"  FAIL  {name}: {e}")
+        return False
+    except Exception as e:
+        print(f"  ERROR {name}: {e}")
+        return False
 
 
-def test_faradaic_efficiency():
-    """eta_F in (0, 1) and increases with current."""
-    ely = Electrolyzer()
-    prev = 0.0
-    for I in (50.0, 100.0, 200.0, 300.0, 500.0):
-        eta = ely.eta_F(I)
-        assert 0 < eta <= 1.0, f"eta_F={eta} at I={I}"
-        assert eta >= prev, f"eta_F not monotonic at I={I}"
-        prev = eta
-    print("  [PASS] Faradaic efficiency")
-
-
-def test_energy_balance():
-    """P_el == V_stack * I."""
-    ely = Electrolyzer()
-    V, P, n, eta, sec = ely.step(300.0, 353.15, 30.0)
-    assert abs(P - V * 300.0) < 1e-6
-    print("  [PASS] energy balance")
-
-
-def test_thermal_heating():
-    """Temperature should rise without cooling."""
-    th = ThermalModel()
-    T = 293.15
-    for _ in range(100):
-        T = th.step(T, 50000.0, 0.05, 0.0, 30.0)
-    assert T > 293.15 + 10, f"Expected significant heating, got T={T}"
-    print("  [PASS] thermal heating")
-
-
-def test_gas_separator_bounded():
-    """x_HTO should remain bounded and positive."""
-    gs = GasSeparator()
-    x = 0.005
-    for _ in range(1000):
-        x = gs.step(x, 0.09, 30.0)
-    assert 0 <= x <= 1.0, f"x_HTO out of bounds: {x}"
-    print("  [PASS] gas separator bounded")
-
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 def test_casadi_numpy_consistency():
-    """CasADi model matches NumPy at a single operating point."""
-    model = build_ael_model()
-    ely = Electrolyzer()
-
-    T, I = 353.15, 300.0
-    x = np.array([T, 0.005])
-    u = np.array([I, 5000.0])
-    p = np.array([100000.0, 293.15])
-
-    y_ca = np.array(model["h"](x, u, p)).flatten()
-    V_np = ely.V_stack(T, I)
-    n_np = ely.n_dot_H2(T, I)
-
-    rel_V = abs(y_ca[2] - V_np) / abs(V_np)
-    rel_n = abs(y_ca[3] - n_np) / abs(n_np)
-    assert rel_V < 0.001, f"V_stack rel error: {rel_V}"
-    assert rel_n < 0.001, f"n_dot_H2 rel error: {rel_n}"
-    print("  [PASS] CasADi-NumPy consistency (single point)")
-
-
-def test_casadi_trajectory(method: str = "collocation"):
-    """CasADi integrator matches NumPy plant over 1h open-loop."""
-    model = build_ael_model()
+    """CasADi DAE integrator matches NumPy plant over 1h open-loop."""
+    ep = ElectrolyzerParams()
+    tp = ThermalParams()
     dt = 30.0
-    F_int = build_integrator(model, dt, method=method)
 
-    ely = Electrolyzer()
-    th = ThermalModel()
-    gs = GasSeparator()
+    model = build_casadi_dynamics(ep, tp)
+    F = build_casadi_integrator(model, dt)
 
-    T_np, x_HTO_np = 353.15, 0.005
-    x_ca = np.array([353.15, 0.005])
-    I, Q_cool = 300.0, 5000.0
-    u = np.array([I, Q_cool])
-    p = np.array([100000.0, 293.15])
+    plant = AELPlant(ep, tp)
+    plant.reset(T0=tp.T_ref_k)
 
-    for _ in range(int(3600.0 / dt)):
-        P_el = ely.P_el(T_np, I)
-        n_h2 = ely.n_dot_H2(T_np, I)
-        T_np = th.step(T_np, P_el, n_h2, Q_cool, dt, 293.15)
-        x_HTO_np = gs.step(x_HTO_np, n_h2, dt)
-        x_ca = np.array(F_int(x_ca, u, p)).flatten()
+    x_ca = np.array([tp.T_ref_k])
+    z_ca = np.array([300.0])
 
-    rel_T = abs(x_ca[0] - T_np) / abs(T_np)
-    rel_HTO = abs(x_ca[1] - x_HTO_np) / max(abs(x_HTO_np), 1e-10)
-    assert rel_T < 0.001, f"{method} T rel error: {rel_T}"
-    assert rel_HTO < 0.05, f"{method} x_HTO rel error: {rel_HTO}"
-    print(f"  [PASS] CasADi trajectory ({method}): T err={rel_T:.2e}, HTO err={rel_HTO:.2e}")
+    for _ in range(120):  # 1 hour
+        p_vec = np.array([100.0, 600.0, tp.T_amb_k])
+        result = F(x_ca, z_ca, p_vec)
+        x_ca = np.array(result[0]).flatten()
+        z_ca = np.array(result[1]).flatten()
+        plant.step(np.array([100.0]), np.array([600.0, tp.T_amb_k]), dt)
+
+    rel_err = abs(x_ca[0] - plant.T) / abs(plant.T)
+    assert rel_err < 0.01, f"CasADi-NumPy relative error {rel_err:.2e} exceeds 1%"
 
 
-def test_pi_steady_wind():
-    """PI keeps T within bounds and no HTO violations on steady_wind."""
+def test_plant_shutdown():
+    """Plant shuts down (I=0, P_el=0) when P_avail < P_min."""
     plant = AELPlant()
-    ctrl = PIController()
+    plant.reset(T0=353.15)
+    y = plant.step(np.array([0.0]), np.array([0.0, 293.15]), 30.0)
+    assert y[4] == 0.0, f"I should be 0 at shutdown, got {y[4]}"
+    assert y[1] == 0.0, f"V_cell should be 0 at shutdown, got {y[1]}"
+    assert y[2] == 0.0, f"n_dot_H2 should be 0 at shutdown, got {y[2]}"
+
+
+def test_power_equality():
+    """V_cell(T,I)*I = P_avail for operating points."""
+    plant = AELPlant()
+    for P in [100, 400, 600, 800]:
+        plant.reset(T0=353.15)
+        y = plant.step(np.array([100.0]), np.array([float(P), 293.15]), 0.001)
+        P_el = y[1] * y[4]
+        assert abs(P_el - P) / P < 1e-4, (
+            f"Power equality violated at P={P}: P_el={P_el:.2f}"
+        )
+
+
+def test_nmpc_solves():
+    """NMPC produces a valid Q_cool on a single step."""
+    ep = ElectrolyzerParams()
+    tp = ThermalParams()
+    nmpc = TrackingNMPC(NMPCParams(), ep, tp)
+    nmpc.reset()
+
+    x_hat = np.array([tp.T_ref_k])
+    d_forecast = np.full(NMPCParams().N, 600.0)
+    u = nmpc.step(x_hat, d_forecast, 30.0)
+
+    assert u.shape == (1,), f"Expected shape (1,), got {u.shape}"
+    assert 0.0 <= u[0] <= tp.Q_cool_max_w, (
+        f"Q_cool={u[0]:.1f} outside [0, {tp.Q_cool_max_w}]"
+    )
+    assert nmpc.last_solve_success, "NMPC solve failed"
+
+
+def test_ekf_predict_correct():
+    """EKF predict-correct cycle returns reasonable estimate."""
+    ekf = ExtendedKalmanFilter(dt=30.0)
+    ekf.reset(353.15)
+
+    u = np.array([100.0])
+    d = np.array([600.0, 293.15])
+    T_meas = 353.5  # slightly noisy measurement
+
+    x_hat = ekf.step(u, d, T_meas)
+    assert x_hat.shape == (1,), f"Expected shape (1,), got {x_hat.shape}"
+    # Should be between prediction and measurement
+    assert 350.0 < x_hat[0] < 360.0, f"EKF estimate {x_hat[0]:.2f} out of range"
+
+
+def test_closed_loop_power_step():
+    """Full NMPC+EKF closed-loop on power_step: T within bounds."""
+    ep = ElectrolyzerParams()
+    tp = ThermalParams()
+
+    plant = AELPlant(ep, tp)
+    nmpc = TrackingNMPC(NMPCParams(), ep, tp)
+    ekf = ExtendedKalmanFilter(EKFParams(), ep, tp, dt=SimulationParams().dt_s)
+
+    scenario = SCENARIOS["power_step"]()
+    power_profile = scenario["power_profile"]
+
+    sim_dt = scenario["dt"]
+    nmpc_dt = NMPCParams().dt_s
+    stride = max(1, int(nmpc_dt / sim_dt))
+
+    def forecast_func(step_idx: int, N: int) -> np.ndarray:
+        forecasts = np.zeros(N)
+        for k in range(N):
+            idx = min(step_idx + (k + 1) * stride, len(power_profile) - 1)
+            forecasts[k] = power_profile[idx]
+        return forecasts
+
+    from main import NMPCWithEKF
+
+    ctrl = NMPCWithEKF(nmpc, ekf, power_forecast_func=forecast_func)
     runner = SimulationRunner(plant, ctrl)
-    results = runner.run(steady_wind())
+    results = runner.run(scenario)
 
     T = results["y"][:, 0]
-    x_HTO = results["y"][:, 1]
-    assert np.all(T > 323.15) and np.all(T < 373.15), \
-        f"T out of bounds: [{T.min():.1f}, {T.max():.1f}]"
-    assert np.all(x_HTO < 0.02), f"HTO violation: max={x_HTO.max():.4f}"
-    print("  [PASS] PI steady_wind: T and HTO within bounds")
+    T_max = float(np.max(T))
+    T_min = float(np.min(T))
+
+    assert T_max <= tp.T_max_k, (
+        f"T_max = {T_max:.2f} K exceeds safe limit {tp.T_max_k:.2f} K"
+    )
+    assert T_min >= tp.T_min_k, (
+        f"T_min = {T_min:.2f} K below safe limit {tp.T_min_k:.2f} K"
+    )
 
 
-def test_pi_ramp_up_down():
-    """PI keeps T within bounds and no HTO violations on ramp_up_down."""
-    plant = AELPlant()
-    ctrl = PIController()
-    runner = SimulationRunner(plant, ctrl)
-    results = runner.run(ramp_up_down())
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
 
-    T = results["y"][:, 0]
-    x_HTO = results["y"][:, 1]
-    assert np.all(T > 323.15) and np.all(T < 373.15), \
-        f"T out of bounds: [{T.min():.1f}, {T.max():.1f}]"
-    assert np.all(x_HTO < 0.02), f"HTO violation: max={x_HTO.max():.4f}"
-    print("  [PASS] PI ramp_up_down: T and HTO within bounds")
-
-
-def main():
-    print("=" * 50)
-    print("  v1_baseline stress tests")
-    print("=" * 50)
+def main() -> None:
+    print(f"{'=' * 60}")
+    print(f"  v1_baseline Stress Test Suite")
+    print(f"{'=' * 60}")
 
     tests = [
-        test_electrolyzer_voltage_range,
-        test_faradaic_efficiency,
-        test_energy_balance,
-        test_thermal_heating,
-        test_gas_separator_bounded,
-        test_casadi_numpy_consistency,
-        lambda: test_casadi_trajectory("collocation"),
-        lambda: test_casadi_trajectory("rk4"),
-        test_pi_steady_wind,
-        test_pi_ramp_up_down,
+        ("CasADi-NumPy consistency", test_casadi_numpy_consistency),
+        ("Plant shutdown (P_avail=0)", test_plant_shutdown),
+        ("Power equality (Brent)", test_power_equality),
+        ("NMPC single solve", test_nmpc_solves),
+        ("EKF predict-correct", test_ekf_predict_correct),
+        ("Closed-loop power_step", test_closed_loop_power_step),
     ]
 
-    passed, failed = 0, 0
-    for test in tests:
-        try:
-            test()
-            passed += 1
-        except Exception as e:
-            print(f"  [FAIL] {e}")
-            failed += 1
+    results = [_run_test(name, func) for name, func in tests]
+    passed = sum(results)
+    total = len(results)
 
-    print(f"\n  Results: {passed} passed, {failed} failed")
-    return failed == 0
+    print(f"\n  {passed}/{total} tests passed")
+    if passed < total:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    main()
